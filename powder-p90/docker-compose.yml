@@ -8,7 +8,16 @@ services:
       - powder-data:/app/data
     environment:
       POWDER_DB: /app/data/powder.db
+      # 外存暂存与见证 CSV 的作业目录，位于命名卷内，容器重建不丢
+      POWDER_JOBS: /app/data/jobs
       SECRET_KEY: demo-secret
+      # 单进程同时进行的核算作业上限（排队提示，不影响补报入库）
+      POWDER_MAX_JOBS: "2"
+    # 大批量核算的暂存主要落磁盘；给进程留足虚拟地址空间即可，常驻内存 O(B+M)
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/')"]
       interval: 10s

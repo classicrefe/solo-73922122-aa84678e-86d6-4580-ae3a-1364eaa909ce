@@ -1,16 +1,42 @@
-"""Flask 网页：按批号上传/补报档表，勾选批次核算合并 P90 最紧界。"""
+"""Flask 网页：按批号上传/补报档表，勾选批次后以外存作业核算合并 P90 最紧界。
+
+核算语义
+--------
+* /compute 只负责登记作业并启动后台线程，立即跳转作业状态页；
+* 作业开始时对主库做一致性快照，上下界、见证、复核全部只读快照，
+  因此核算进行中的同批补报照常入库但不影响在途作业，下次核算才采用新档表；
+* 作业状态 running/ready/failed 落 SQLite jobs 表，详情落作业目录 meta.json；
+* 只有两份见证齐备且逐表/合并复核全部通过，状态才为 ready，页面才出现下载入口；
+  核算或暂存失败时状态为 failed，页面展示原因。
+"""
 from __future__ import annotations
 
+import json
 import os
+import re
+import threading
 from dataclasses import asdict
 
-from flask import Flask, flash, redirect, render_template, request, url_for
+from flask import (
+    Flask,
+    abort,
+    flash,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    url_for,
+)
 
-from .core import BinTableError, compatible, merge_p90
+from . import engine
+from .core import BinTableError, compatible
 from .db import (
     connect,
+    count_running_jobs,
     create_batch,
+    create_job,
     get_batch_by_name,
+    get_job,
     init_db,
     insert_table,
     list_batches,
@@ -18,7 +44,11 @@ from .db import (
     load_batch_tables,
     load_table,
     parse_and_preview,
+    set_job_status,
 )
+
+JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+MAX_CONCURRENT_JOBS = int(os.environ.get("POWDER_MAX_JOBS", "2"))
 
 
 def create_app(db_path: str | None = None) -> Flask:
@@ -27,14 +57,61 @@ def create_app(db_path: str | None = None) -> Flask:
     app.config["DB_PATH"] = db_path or os.environ.get(
         "POWDER_DB", os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "powder.db")
     )
-    os.makedirs(os.path.dirname(app.config["DB_PATH"]), exist_ok=True)
+    data_dir = os.path.dirname(app.config["DB_PATH"])
+    app.config["JOBS_DIR"] = os.environ.get(
+        "POWDER_JOBS", os.path.join(data_dir, "jobs")
+    )
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(app.config["JOBS_DIR"], exist_ok=True)
     init_db(app.config["DB_PATH"])
+
+    # 进程重启后，此前 running 的作业不可能再完成，标记失败并说明原因。
+    with connect(app.config["DB_PATH"]) as conn:
+        conn.execute(
+            "UPDATE jobs SET status='failed', reason='服务进程重启，作业中断', "
+            "updated_at=datetime('now') WHERE status='running'"
+        )
+
+    def _job_dir(job_id: str) -> str:
+        return os.path.join(app.config["JOBS_DIR"], job_id)
+
+    def _read_meta(job_id: str) -> dict | None:
+        meta_path = os.path.join(_job_dir(job_id), "meta.json")
+        if not os.path.exists(meta_path):
+            return None
+        try:
+            with open(meta_path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _run_job(job_id: str, ids: list[int], names: dict[int, str]) -> None:
+        work_dir = _job_dir(job_id)
+
+        def status_writer(status: str, reason: str = "") -> None:
+            with connect(app.config["DB_PATH"]) as conn:
+                set_job_status(conn, job_id, status, reason)
+
+        try:
+            engine.execute_job(
+                job_id=job_id,
+                work_dir=work_dir,
+                db_path=app.config["DB_PATH"],
+                batch_ids=ids,
+                batch_names=names,
+                status_writer=status_writer,
+            )
+        finally:
+            engine.SpoolArray.close_all()
 
     @app.route("/")
     def index():
         with connect(app.config["DB_PATH"]) as conn:
             batches = [dict(r) for r in list_batches(conn)]
-        return render_template("index.html", batches=batches)
+            jobs = [dict(r) for r in conn.execute(
+                "SELECT * FROM jobs ORDER BY created_at DESC, id DESC LIMIT 10"
+            )]
+        return render_template("index.html", batches=batches, jobs=jobs)
 
     @app.route("/upload", methods=["POST"])
     def upload():
@@ -75,7 +152,8 @@ def create_app(db_path: str | None = None) -> Flask:
                 table_id = insert_table(conn, batch_id, table, note)
                 flash(
                     f"批 {name} 补报成功：档表 #{table_id} 与已有 {len(existing)} 张档表相容，"
-                    f"现共 {len(existing) + 1} 张档表、{table.total} 粒",
+                    f"现共 {len(existing) + 1} 张档表、{table.total} 粒。"
+                    "进行中的核算不受影响，下一次核算采用新档表。",
                     "ok",
                 )
         return redirect(url_for("index"))
@@ -97,54 +175,97 @@ def create_app(db_path: str | None = None) -> Flask:
 
     @app.route("/compute", methods=["POST"])
     def compute():
-        ids = [int(x) for x in request.form.getlist("batch_ids")]
+        raw_ids = request.form.getlist("batch_ids")
+        try:
+            ids = [int(x) for x in raw_ids]
+        except ValueError:
+            flash("批次参数非法", "error")
+            return redirect(url_for("index"))
         if not ids:
             flash("请至少勾选一个批次", "error")
             return redirect(url_for("index"))
+        if len(ids) != len(set(ids)):
+            flash("勾选的批次有重复，请重新选择", "error")
+            return redirect(url_for("index"))
+
         with connect(app.config["DB_PATH"]) as conn:
             all_batches = {int(r["id"]): dict(r) for r in list_batches(conn)}
             missing = [i for i in ids if i not in all_batches]
             if missing:
                 flash(f"批次不存在：{missing}", "error")
                 return redirect(url_for("index"))
-            batch_tables = [(bid, load_batch_tables(conn, bid)) for bid in ids]
-            if any(not ts for _, ts in batch_tables):
-                flash("所选批次中存在没有任何档表的批，无法核算", "error")
+            empty = [
+                all_batches[i]["name"] for i in ids
+                if int(all_batches[i].get("table_count") or 0) <= 0
+            ]
+            if empty:
+                flash(f"以下批次没有任何档表，无法核算：{empty}", "error")
                 return redirect(url_for("index"))
-            try:
-                result = merge_p90(batch_tables)
-            except BinTableError as exc:
-                flash(f"核算失败：{exc}", "error")
+            if count_running_jobs(conn) >= MAX_CONCURRENT_JOBS:
+                flash(
+                    "当前已有核算作业在进行，请等待其完成后再发起（作业在独立快照上运行，"
+                    "补报不受影响）。",
+                    "error",
+                )
                 return redirect(url_for("index"))
+            names = {bid: all_batches[bid]["name"] for bid in ids}
 
-            # 逐批见证频数整理为有序列表，并附每批名称
-            def witness_rows(witness):
-                out = []
-                for bid in ids:
-                    freq = witness[bid]
-                    rows = [
-                        {"size": s, "count": freq[s]} for s in sorted(freq) if freq[s]
-                    ]
-                    out.append(
-                        {
-                            "batch_id": bid,
-                            "batch_name": all_batches[bid]["name"],
-                            "total": sum(freq.values()),
-                            "rows": rows,
-                        }
-                    )
-                return out
+            job_id = engine.new_job_id()
+            work_dir = _job_dir(job_id)
+            os.makedirs(work_dir, exist_ok=False)
+            # 作业行先入库（running），后台线程只更新状态
+            create_job(conn, job_id, ids)
 
-            ctx = {
-                "names": {bid: all_batches[bid]["name"] for bid in ids},
-                "ids": ids,
-                "total": result.total,
-                "k": result.k,
-                "p90_low": result.p90_low,
-                "p90_high": result.p90_high,
-                "witness_low": witness_rows(result.witness_low),
-                "witness_high": witness_rows(result.witness_high),
-            }
-        return render_template("result.html", **ctx)
+        thread = threading.Thread(
+            target=_run_job, args=(job_id, ids, names), name=f"job-{job_id}", daemon=True
+        )
+        thread.start()
+        return redirect(url_for("job_detail", job_id=job_id))
+
+    @app.route("/jobs/<job_id>")
+    def job_detail(job_id: str):
+        if not JOB_ID_RE.fullmatch(job_id):
+            abort(404)
+        with connect(app.config["DB_PATH"]) as conn:
+            row = get_job(conn, job_id)
+            if row is None:
+                abort(404)
+            job = dict(row)
+        meta = _read_meta(job_id) or {}
+        # 见证文件齐备且作业 ready 才开放下载
+        files_ready = False
+        if job["status"] == "ready":
+            files_ready = all(
+                os.path.exists(os.path.join(_job_dir(job_id), meta.get("files", {}).get(k, "")))
+                for k in ("low", "high")
+            )
+        return render_template(
+            "job.html", job=job, meta=meta, files_ready=files_ready
+        )
+
+    @app.route("/jobs/<job_id>/download/<which>")
+    def job_download(job_id: str, which: str):
+        if not JOB_ID_RE.fullmatch(job_id) or which not in ("low", "high"):
+            abort(404)
+        with connect(app.config["DB_PATH"]) as conn:
+            row = get_job(conn, job_id)
+            if row is None:
+                abort(404)
+            if row["status"] != "ready":
+                flash("见证尚未齐备，无法下载", "error")
+                return redirect(url_for("job_detail", job_id=job_id))
+        meta = _read_meta(job_id) or {}
+        rel = meta.get("files", {}).get(which)
+        if not rel:
+            abort(404)
+        path = os.path.join(_job_dir(job_id), rel)
+        if not os.path.exists(path):
+            abort(404)
+        return send_file(
+            path,
+            as_attachment=True,
+            download_name=f"p90_{which}_witness_{job_id[:8]}.csv",
+            mimetype="text/csv",
+        )
 
     return app

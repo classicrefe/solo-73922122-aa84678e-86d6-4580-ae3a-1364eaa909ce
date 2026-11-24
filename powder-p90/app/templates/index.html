@@ -39,10 +39,35 @@ placeholder="lo hi count
     </tbody>
   </table>
   <p style="margin-top:12px"><button type="submit">核算合并 P90 最紧界</button>
-     <span class="muted">P90 = 升序第 ⌈0.9×总粒数⌉ 粒；结果附两份达到端点的逐批粒径频数见证。</span></p>
+     <span class="muted">提交后生成核算作业：先对已提交数据做一致性快照，再以外存方式按档计算；
+     见证复核通过后在作业页提供两端完整逐批频数 CSV 下载。</span></p>
   {% else %}
   <p class="muted">还没有任何批次，请先在上方上传档表。</p>
   {% endif %}
 </div>
 </form>
+
+{% if jobs %}
+<div class="card">
+  <h2>最近核算作业</h2>
+  <table>
+    <thead><tr><th class="l">作业</th><th>状态</th><th class="l">说明 / 失败原因</th><th>创建时间</th><th class="l">操作</th></tr></thead>
+    <tbody>
+    {% for j in jobs %}
+      <tr>
+        <td class="l"><code>{{ j.id[:8] }}</code></td>
+        <td>
+          {% if j.status == 'running' %}<span style="color:var(--brand)">核算中</span>
+          {% elif j.status == 'ready' %}<span style="color:var(--ok)">完成</span>
+          {% else %}<span style="color:var(--err)">失败</span>{% endif %}
+        </td>
+        <td class="l">{{ j.reason or '—' }}</td>
+        <td>{{ j.created_at }}</td>
+        <td class="l"><a href="{{ url_for('job_detail', job_id=j.id) }}">查看作业</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
 {% endblock %}

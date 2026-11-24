@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block body %}
+{% if job.status == 'running' %}
+  <meta http-equiv="refresh" content="2">
+{% endif %}
+<div class="card">
+  <h2>跨批核算作业 <span class="pill">{{ job.id[:8] }}</span></h2>
+  <p class="muted">
+    作业开始时已对数据库做一致性快照，上下界、见证与全部复核均基于该快照；
+    期间同批补报照常入库，不影响本作业，下一次核算才会采用新档表。
+  </p>
+  {% if job.status == 'running' %}
+    <p class="bound">状态：<b>核算中…</b></p>
+    <p class="muted">页面每 2 秒自动刷新。外存模式下工作内存只随批次数与最大单批档数线性增长，大批量数据落在本地磁盘。</p>
+  {% elif job.status == 'failed' %}
+    <p class="bound">状态：<b style="color:var(--err)">核算失败</b></p>
+    <div class="flash error">失败原因：{{ job.reason or meta.reason or '未知错误' }}</div>
+    <p class="muted">未生成任何见证下载入口；请修正后重新发起核算。</p>
+  {% else %}
+    <p class="bound">状态：<b style="color:var(--ok)">完成，见证齐备且复核通过</b></p>
+    <p class="muted">参与批次：
+      {% for bid in meta.batch_ids %}
+        <span class="pill">{{ meta.batch_names[bid|string] }}（#{{ bid }}）</span>
+      {% endfor %}
+    </p>
+    <p class="muted">合并总粒数 <b>{{ meta.total }}</b>（按档求和，未逐粒展开）；
+       k = ⌈0.9 × {{ meta.total }}⌉ = <b>{{ meta.k }}</b>，P90 即升序第 {{ meta.k }} 粒的粒径。</p>
+    <p class="bound">P90 最紧下界（最小可能值）：<b>{{ meta.p90_low }}</b> 微米</p>
+    <p class="bound">P90 最紧上界（最大可能值）：<b>{{ meta.p90_high }}</b> 微米</p>
+    <p class="muted">含义：在所有满足各批全部已入库档表（快照中的已提交状态）的粒子组中，
+       合并 P90 可取到的最小值与最大值；两份逐批频数见证分别真实取到这两个端点。</p>
+  {% endif %}
+</div>
+
+{% if job.status == 'ready' %}
+<div class="card">
+  <h2>逐批频数见证 CSV 下载</h2>
+  {% if files_ready %}
+  <p>
+    <a href="{{ url_for('job_download', job_id=job.id, which='low') }}">
+      <button type="button">下载下界见证 CSV（{{ meta.full_low_rows }} 行逐批频数）</button>
+    </a>
+    <a href="{{ url_for('job_download', job_id=job.id, which='high') }}" style="margin-left:12px">
+      <button type="button">下载上界见证 CSV（{{ meta.full_high_rows }} 行逐批频数）</button>
+    </a>
+  </p>
+  <p class="muted">CSV 列：<code>batch_id,batch_name,size_micron,count</code>；
+     每份包含全部所选批次的逐批频数，各批频数符合本批全部档表，两端各批频数合并后第
+     {{ meta.k }} 粒恰好取到对应 P90 端点（已流式复核）。</p>
+  {% else %}
+  <div class="flash error">见证文件缺失，无法下载；请重新发起核算。</div>
+  {% endif %}
+
+  <h3 style="font-size:14px;margin:16px 0 6px">逐批核算明细</h3>
+  <table>
+    <thead><tr>
+      <th class="l">批号</th><th>档表数</th><th>总粒数</th>
+      <th>下界见证行数</th><th>上界见证行数</th>
+    </tr></thead>
+    <tbody>
+    {% for s in meta.per_batch %}
+      <tr>
+        <td class="l">{{ meta.batch_names[s.batch_id|string] }}（#{{ s.batch_id }}）</td>
+        <td>{{ s.n_tables }}</td>
+        <td>{{ s.total }}</td>
+        <td>{{ s.low_rows }}</td>
+        <td>{{ s.high_rows }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+</div>
+
+<p><a href="{{ url_for('index') }}">← 返回首页</a></p>
+{% endblock %}

@@ -28,12 +28,47 @@ CREATE TABLE IF NOT EXISTS bins (
 );
 CREATE INDEX IF NOT EXISTS idx_tables_batch ON tables(batch_id);
 CREATE INDEX IF NOT EXISTS idx_bins_table ON bins(table_id);
+CREATE TABLE IF NOT EXISTS jobs (
+    id          TEXT PRIMARY KEY,
+    status      TEXT NOT NULL CHECK (status IN ('running','ready','failed')),
+    reason      TEXT NOT NULL DEFAULT '',
+    batch_ids   TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 """
 
 
 def init_db(path: str) -> None:
     with connect(path) as conn:
         conn.executescript(SCHEMA)
+
+
+def create_job(conn: sqlite3.Connection, job_id: str, batch_ids: list[int]) -> None:
+    conn.execute(
+        "INSERT INTO jobs(id, status, reason, batch_ids) VALUES (?, 'running', ?, ?)",
+        (job_id, "", ",".join(str(i) for i in batch_ids)),
+    )
+
+
+def set_job_status(conn: sqlite3.Connection, job_id: str,
+                   status: str, reason: str = "") -> None:
+    conn.execute(
+        "UPDATE jobs SET status = ?, reason = ?, updated_at = datetime('now') WHERE id = ?",
+        (status, reason, job_id),
+    )
+
+
+def get_job(conn: sqlite3.Connection, job_id: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+
+
+def count_running_jobs(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM jobs WHERE status = 'running'"
+    ).fetchone()
+    return int(row["n"])
 
 
 @contextmanager
